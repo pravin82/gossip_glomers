@@ -39,6 +39,7 @@ class Node(
     private val logLock = ReentrantLock()
     private val mapper = jacksonObjectMapper()
     private val kafkaLogs = mutableMapOf<String, List<Int>>()
+    private val commitedOffsets = mutableMapOf<String, Int>()
 
 
     fun logMsg(msg:String) {
@@ -58,16 +59,57 @@ class Node(
                 MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
             }
 
-            "read" -> {
-                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId , )
-            }
             "send" -> {
                 val key = body.key?:EMPTY_STRING
                 val logsList = kafkaLogs.get(key)?.toMutableList()
-                val newList = logsList?.plus(body.msg?:-1)?: emptyList()
+                val newList = (logsList?: emptyList()).plus(body.msg?:-1)
+                logLock.tryLock(5, TimeUnit.SECONDS)
                  kafkaLogs.put(key, newList )
-                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId , offset = newList.size )
+                logLock.unlock()
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId , offset = newList.size -1 )
             }
+
+            "poll" -> {
+                val pollOffsets = body.offsets
+                val logMsgs = mutableMapOf<String, List<List<Int>>>()
+                logLock.tryLock(5, TimeUnit.SECONDS)
+                pollOffsets?.forEach {
+                    val logKey = it.key
+                    val logOffset = it.value
+                    val kafkaLogValue = kafkaLogs.get(logKey)
+
+                  val valueToBeSent =   kafkaLogValue?.mapIndexed{index, i ->
+                     if(index >= logOffset){
+                         listOf(index, i)
+                     } else null
+
+                    }?.filterNotNull()
+
+                    logMsgs.put(logKey, valueToBeSent?: emptyList())
+
+                }
+                logLock.unlock()
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId, msgs = logMsgs )
+            }
+
+            "commit_offsets" -> {
+                logLock.tryLock(5, TimeUnit.SECONDS)
+                body.offsets?.map{
+                    commitedOffsets.put(it.key, it.value)
+                }
+                logLock.unlock()
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
+            }
+
+            "list_committed_offsets" -> {
+                val offsets = mutableMapOf<String,Int>()
+                body.keys?.map{
+                  offsets.put(it, commitedOffsets.get(it)?:-1)
+                }
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId, offsets = offsets )
+
+            }
+
 
 
             else -> {
@@ -124,6 +166,9 @@ data class MsgBody(
         @JsonProperty("in_reply_to")   val inReplyTo :Int? = null,
         val key:String? = null,
         val msg:Int? = null,
-        val offset:Int? = null
+        val offset:Int? = null,
+        val offsets:Map<String, Int>? = null,
+        val msgs:Map<String,List<List<Int>>>? = null,
+        val keys:List<String>? = null
 
 )
