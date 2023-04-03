@@ -1,3 +1,3 @@
 # gossip_glomers
 
-Kotlin implementation of Fly.io gossip_glomers challenges
+Kotlin implementation of fly.io gossip_glomers challenges.
