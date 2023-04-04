@@ -1,5 +1,5 @@
 #!/usr/bin/env kotlin
-// ./maelstrom test -w broadcast  --bin /Users/pravin/script2/script2.main.kts   --time-limit 5  --log-stderr
+// ./maelstrom test -w kafka --bin /Users/pravin/gossip_glomers/kafka.main.kts  --node-count 1 --concurrency 2n --time-limit 20  --rate 1000 --log-stderr
 @file:Repository("https://jcenter.bintray.com")
 @file:DependsOn("com.fasterxml.jackson.core:jackson-core:2.14.2")
 @file:DependsOn("com.fasterxml.jackson.module:jackson-module-kotlin:2.14.2")
@@ -9,6 +9,7 @@ import com.fasterxml.jackson.annotation.JsonProperty
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.thread
 
 
 val mapper = jacksonObjectMapper()
@@ -26,7 +27,7 @@ while(true){
     }
     val node =  nodeMap.get(echoMsg.dest)
     System.err.println("Received $input")
-    node?.sendReplyMsg(echoMsg)
+   thread{ node?.sendReplyMsg(echoMsg)}
 
 }
 
@@ -38,9 +39,10 @@ class Node(
     private val lock = ReentrantLock()
     private val logLock = ReentrantLock()
     private val mapper = jacksonObjectMapper()
-    private val kafkaLogs = mutableMapOf<String, List<Int>>()
-    private val commitedOffsets = mutableMapOf<String, Int>()
-
+    private var doesValueRec = false
+    private val condition = lock.newCondition()
+    private var linKVStoreValue:Any? = null
+    private var wasWriteSuccessful = false
 
     fun logMsg(msg:String) {
         logLock.tryLock(5, TimeUnit.SECONDS)
@@ -61,12 +63,12 @@ class Node(
 
             "send" -> {
                 val key = body.key?:EMPTY_STRING
-                val logsList = kafkaLogs.get(key)?.toMutableList()
-                val newList = (logsList?: emptyList()).plus(body.msg?:-1)
-                logLock.tryLock(5, TimeUnit.SECONDS)
-                 kafkaLogs.put(key, newList )
-                logLock.unlock()
-                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId , offset = newList.size -1 )
+                val offset =  writeToKey(key, body.msg?:-1)
+                val replyTypeForSend = when(offset>=0){
+                    true -> replyType
+                    else -> "error"
+                }
+                MsgBody(replyTypeForSend,msgId = randMsgId, inReplyTo = body.msgId , offset = offset )
             }
 
             "poll" -> {
@@ -76,16 +78,21 @@ class Node(
                 pollOffsets?.forEach {
                     val logKey = it.key
                     val logOffset = it.value
-                    val kafkaLogValue = kafkaLogs.get(logKey)
+                    val kafkaLogValue = try {readValueForKey(logKey) as List<List<Int>>}
+                    catch (e:java.lang.Exception){
+                        emptyList()
+                    }
 
-                  val valueToBeSent =   kafkaLogValue?.mapIndexed{index, i ->
-                     if(index >= logOffset){
-                         listOf(index, i)
-                     } else null
+                  val valueToBeSent = kafkaLogValue.map{ valueOffSetList->
+                      val index = valueOffSetList.firstOrNull()?:-1
+                      val value = valueOffSetList.get(1)
+                      if(index >= logOffset){
+                          listOf(index, value)
+                      } else null
 
-                    }?.filterNotNull()
+                  }.filterNotNull()
 
-                    logMsgs.put(logKey, valueToBeSent?: emptyList())
+                    logMsgs.put(logKey, valueToBeSent)
 
                 }
                 logLock.unlock()
@@ -95,7 +102,7 @@ class Node(
             "commit_offsets" -> {
                 logLock.tryLock(5, TimeUnit.SECONDS)
                 body.offsets?.map{
-                    commitedOffsets.put(it.key, it.value)
+                    overWriteKey("co_${it.key}", it.value)
                 }
                 logLock.unlock()
                 MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
@@ -104,10 +111,42 @@ class Node(
             "list_committed_offsets" -> {
                 val offsets = mutableMapOf<String,Int>()
                 body.keys?.map{
-                  offsets.put(it, commitedOffsets.get(it)?:-1)
+                    val linKVOffset = try{readValueForKey("co_${it}") as Int}
+                    catch(e:java.lang.Exception){
+                        -1
+                    }
+                  offsets.put(it, linKVOffset)
                 }
                 MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId, offsets = offsets )
 
+            }
+
+            "read_ok" -> {
+                lock.tryLock(5,TimeUnit.SECONDS)
+                val storeValue = body.value
+                linKVStoreValue = storeValue
+                doesValueRec = true
+                condition.signal()
+                lock.unlock()
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
+            }
+
+            "cas_ok", "write_ok" -> {
+                lock.tryLock(5,TimeUnit.SECONDS)
+                doesValueRec = true
+                wasWriteSuccessful = true
+                condition.signal()
+                lock.unlock()
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
+            }
+
+            "error" -> {
+                lock.tryLock(5,TimeUnit.SECONDS)
+                doesValueRec = true
+                linKVStoreValue = null
+                condition.signal()
+                lock.unlock()
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
             }
 
 
@@ -119,7 +158,7 @@ class Node(
                 MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
             }
         }
-
+        if(body.type in listOf("read_ok","write_ok", "cas_ok", "write_ok", "error")) return
         val msg = NodeMsg(echoMsg.id,echoMsg.src,replyBody,echoMsg.dest)
         val replyStr =   mapper.writeValueAsString(msg)
         lock.tryLock(5,TimeUnit.SECONDS)
@@ -130,19 +169,58 @@ class Node(
 
 
     }
-    //MsgId will be -1 if it is being sent from node
-    fun sendMsg(destId:String, msg:NodeMsg){
-        val body = msg.body
-        val bodyToBeSent = MsgBody(body.type,msgId = (0..10000).random(), inReplyTo = body.msgId)
-        val msgToBeSent =  NodeMsg(msg.id,destId, bodyToBeSent, nodeId)
-        val replyStr =   mapper.writeValueAsString(msgToBeSent)
+    fun sendMsgSync(destId:String, body:MsgBody):Any?{
         lock.tryLock(5,TimeUnit.SECONDS)
-        System.err.println("Sent to Neighbor $replyStr")
+        val msgToBeSent =  NodeMsg(1,destId, body, nodeId)
+        val replyStr =   mapper.writeValueAsString(msgToBeSent)
+        System.err.println("Sent to lin-kv $replyStr")
         System.out.println( replyStr)
         System.out.flush()
+        doesValueRec = false
+        while(!doesValueRec){
+            condition.await()
+        }
         lock.unlock()
+        return linKVStoreValue
 
     }
+
+    fun readValueForKey(key:String):Any?{
+        val randMsgId = (0..10000).random()
+        val body = MsgBody("read",msgId = randMsgId, key = key)
+        val linkvValue = sendMsgSync("lin-kv", body)
+        return linkvValue
+    }
+
+    fun writeToKey(key:String, value:Int):Int{
+        val randMsgId = (0..10000).random()
+        val body = MsgBody("read",msgId = randMsgId, key = key)
+        val linkvValue = try{ sendMsgSync("lin-kv", body) as List<List<Int>>}
+        catch (e:Exception){
+         emptyList()
+        }
+        val newValue =   linkvValue.toMutableList().plus(listOf(listOf(linkvValue.size, value)))
+        val writeReq = MsgBody("cas", key = key, from = linkvValue, to = newValue, createIfNotExists = true ,msgId = (0..10000).random() )
+        logLock.tryLock(5,TimeUnit.SECONDS)
+         wasWriteSuccessful = false
+         sendMsgSync("lin-kv", writeReq)
+        logLock.unlock()
+        return when(wasWriteSuccessful){
+            true -> newValue.size -1
+            else -> -1
+        }
+    }
+
+    fun overWriteKey(key:String, value: Int):Boolean{
+        val writeReq = MsgBody("write", key = key,  value = value ,msgId = (0..10000).random() )
+        logLock.tryLock(5,TimeUnit.SECONDS)
+        wasWriteSuccessful = false
+        sendMsgSync("lin-kv", writeReq)
+        logLock.unlock()
+        return wasWriteSuccessful
+
+    }
+
 }
 
 
@@ -169,6 +247,12 @@ data class MsgBody(
         val offset:Int? = null,
         val offsets:Map<String, Int>? = null,
         val msgs:Map<String,List<List<Int>>>? = null,
-        val keys:List<String>? = null
+        val keys:List<String>? = null,
+        val value:Any? = null,
+        @JsonProperty("create_if_not_exists")   val createIfNotExists :Boolean? = null,
+        val from:List<List<Int>>? = null,
+        val to:List<List<Int>>? = null,
+        val code:Int? = null,
+        val text:String? = null
 
 )
