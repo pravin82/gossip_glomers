@@ -44,6 +44,9 @@ class Node(val nodeId:String, val nodeIds:List<String>){
     var doesReadValueRec = true
     val entriesLog = listOf(LogEntry(0)).toMutableList()
     var voteResp = NodeMsg(0,"", MsgBody(""),"")
+    val  stateMachine = StorageMap()
+    val minRepInterval = 50
+
 
 
     private val condition = lock.newCondition()
@@ -79,6 +82,13 @@ class Node(val nodeId:String, val nodeIds:List<String>){
                 MsgBody("request_vote_res", term = term,voteGranted = shouldGrantVote )
 
             }
+            in listOf("cas","read","write") ->{
+                logLock.tryLock(5,TimeUnit.SECONDS)
+               val opResult = handleOperation(body)
+                logLock.unlock()
+                MsgBody(opResult.type, msgId = randMsgId, inReplyTo = body.msgId ,value = opResult.value)
+
+            }
 
 
             else -> {
@@ -97,6 +107,15 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         System.out.flush()
         lock.unlock()
 
+    }
+    fun handleOperation(body:MsgBody):OpResult{
+        var opResult = OpResult("error", msg = "not a leader")
+        if(nodeState == "leader"){
+            entriesLog.add(LogEntry(body.term?:0, body))
+            opResult =  stateMachine.apply(body)
+            System.err.println("Log of leader :${mapper.writeValueAsString(entriesLog)}")
+        }
+        return opResult
 
     }
     fun becomeCandidate(){
@@ -271,6 +290,45 @@ class Node(val nodeId:String, val nodeIds:List<String>){
 
 }
 
+class StorageMap(){
+    val storageMap = mutableMapOf<String,Int>()
+    fun apply(op:MsgBody):OpResult{
+        val key = op.key?:""
+
+        val result =   when(op.type){
+
+            "read" -> {
+                val value = storageMap.get(key)
+                if(value != null){
+                    OpResult("read_ok",value =  value)
+                }
+                else  OpResult("error",msg = "key not found")
+            }
+            "write" -> {
+                storageMap.put(key, value = op.value?:-1)
+                OpResult("write_ok")
+            }
+            "cas" -> {
+                val value = storageMap.get(key)
+                if(value != null) {
+                    if(value != op.from) OpResult("error",msg = "expected ${op.from}, but had ${value}",code = 22)
+                    else {
+                        storageMap.put(key, op.to?:-1)
+                        OpResult("cas_ok")
+                    }
+
+                }
+                else  OpResult("error",msg = "key not found", code = 20)
+
+            }
+            else  -> {OpResult("error",msg =  "error msg")}
+        }
+        return result
+
+    }
+}
+
+
 
 data class NodeMsg(
     val id:Int,
@@ -292,11 +350,23 @@ data class MsgBody(
     @JsonProperty("last_log_term") val lastLogTerm:Int? = null,
     @JsonProperty("vote_granted") val voteGranted:Boolean? = null,
     @JsonProperty("candidate_id") val candidateId:String? = null,
+    val key:String? = null,
+    val from: Int? = null,
+    val to: Int? = null,
+    val value:Int? = null,
 
     )
 
 data class LogEntry(
     val term:Int,
     val body:MsgBody?=null
+)
+
+
+data class OpResult(
+    val type:String,
+    val msg:String? = null,
+    val value:Int? = null,
+    val code:Int? = null
 )
 
