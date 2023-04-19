@@ -46,6 +46,11 @@ class Node(val nodeId:String, val nodeIds:List<String>){
     var voteResp = NodeMsg(0,"", MsgBody(""),"")
     val  stateMachine = StorageMap()
     val minRepInterval = 50
+    var lastReplicatedAt = System.currentTimeMillis()
+    val nextIndexMap = mutableMapOf<String,Int>()
+    val matchIndexMap = mutableMapOf<String,Int>()
+    val heartBeatInterval = 1000
+    var commitIndex = 0
 
 
 
@@ -62,6 +67,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
                 thread{
                     candidateScheduler()
                     stepDownScheduler()
+                    logReplicateScheduler()
                 }
                 MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
             }
@@ -84,21 +90,36 @@ class Node(val nodeId:String, val nodeIds:List<String>){
             }
             in listOf("cas","read","write") ->{
                 logLock.tryLock(5,TimeUnit.SECONDS)
-               val opResult = handleOperation(body)
+                val opResult = handleOperation(body)
                 logLock.unlock()
                 MsgBody(opResult.type, msgId = randMsgId, inReplyTo = body.msgId ,value = opResult.value)
 
             }
+            "append_entries" -> {
+                logLock.tryLock(5,TimeUnit.SECONDS)
+                val replyBody = handleAppendEntries(body)
+                logLock.unlock()
+               replyBody
+            }
+
+            "append_entries_res" -> {
+                lock.tryLock(5,TimeUnit.SECONDS)
+                doesReadValueRec = true
+                voteResp = echoMsg
+                condition.signal()
+                lock.unlock()
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
+            }
+
+
 
 
             else -> {
-                logLock.tryLock(5,TimeUnit.SECONDS)
                 System.err.println("In else ${body.type} message  recived")
-                logLock.unlock()
                 MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
             }
         }
-        if(body.type in listOf("read_ok","write_ok", "request_vote_res", "write_ok", "error")) return
+        if(body.type in listOf("read_ok","write_ok", "request_vote_res", "write_ok", "error","append_entries_ok", "append_entries_res_ok")) return
         val msg = NodeMsg(echoMsg.id,echoMsg.src,replyBody,echoMsg.dest)
         val replyStr =   mapper.writeValueAsString(msg)
         lock.tryLock(5,TimeUnit.SECONDS)
@@ -108,10 +129,37 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         lock.unlock()
 
     }
+
+    fun handleAppendEntries(body:MsgBody):MsgBody{
+       maybeStepDown(body.term?:-1)
+        val replyBody = MsgBody("append_entries_res", term = term, success = false)
+        if(body.term?:-1 < term){
+            System.err.println("Rejecting append entries Remote term :${body.term}, Node term: ${term}")
+            return replyBody
+        }
+        val prevLogIndex = body.prevLogIndex?:-1
+        resetElectionDeadline()
+        if( prevLogIndex <= 0)  {
+            System.err.println("Out of bounds previous log index ${prevLogIndex}")
+            return replyBody
+        }
+       val nodePrevLog =  entriesLog.getOrNull(prevLogIndex)
+        if(nodePrevLog == null || nodePrevLog.term != body.prevLogTerm){
+            System.err.println("Rejecting append entries NodePrevLog:${nodePrevLog}, RemotePrevLogTerm:${body.prevLogTerm}")
+            return replyBody
+        }
+        entriesLog.subList(prevLogIndex, entriesLog.size).clear()
+        entriesLog.addAll(body.entries?: emptyList())
+        if(commitIndex < body.leaderCommit?:0){
+            commitIndex = minOf(entriesLog.size, body.leaderCommit?:0)
+        }
+        return MsgBody("append_entries_res", term = term, success = true)
+
+    }
     fun handleOperation(body:MsgBody):OpResult{
         var opResult = OpResult("error", msg = "not a leader")
         if(nodeState == "leader"){
-            entriesLog.add(LogEntry(body.term?:0, body))
+            entriesLog.add(LogEntry(term, body))
             opResult =  stateMachine.apply(body)
             System.err.println("Log of leader :${mapper.writeValueAsString(entriesLog)}")
         }
@@ -167,12 +215,15 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         lock.tryLock(5,TimeUnit.SECONDS)
         nodeState = "follower"
         resetElectionDeadline()
+        matchIndexMap.clear()
+        nextIndexMap.clear()
         System.err.println("Became follower for term :${term}")
         lock.unlock()
 
     }
     fun sendSyncMsg(msg:String):NodeMsg{
         lock.tryLock(5,TimeUnit.SECONDS)
+        System.err.println("Sent Sync $msg")
         System.out.println( msg)
         System.out.flush()
         doesReadValueRec = false
@@ -235,6 +286,13 @@ class Node(val nodeId:String, val nodeIds:List<String>){
             return
         }
         nodeState = "leader"
+        lastReplicatedAt = 0
+        nextIndexMap.clear()
+        matchIndexMap.clear()
+        neighBorIds.map{
+            nextIndexMap.put(it, entriesLog.size+1)
+            matchIndexMap.put(it,0)
+        }
         resetStepDownDeadline()
         System.err.println("Became leader for term :${term}")
         lock.unlock()
@@ -274,7 +332,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
     fun stepDownScheduler(){
         Timer().scheduleAtFixedRate( object : TimerTask() {
             override fun run() {
-                if(electionDeadline < System.currentTimeMillis() && nodeState == "leader"){
+                if(stepDownDeadline < System.currentTimeMillis() && nodeState == "leader"){
                     System.err.println("Stepping down: haven't received any acks recently")
                     becomeFollower()
                 }
@@ -282,7 +340,55 @@ class Node(val nodeId:String, val nodeIds:List<String>){
 
             }
         }, 0, 100)
+    }
 
+    fun replicateLog(){
+        lock.tryLock(5,TimeUnit.SECONDS)
+        val elapsedTime = System.currentTimeMillis() - lastReplicatedAt
+        var replicated = false
+        val term = term
+        if (nodeState == "leader" && minRepInterval < elapsedTime){
+            neighBorIds.map{neighBorId->
+                val ni =  nextIndexMap.get(neighBorId)?:0
+                val prevLogTerm = when(ni >= 2){
+                    true -> entriesLog[ni-2].term
+                    else -> -1
+                }
+                val entriesToReplicate = entriesLog.slice(ni-1..entriesLog.size-1)    
+                if(entriesToReplicate.size > 0 || heartBeatInterval < elapsedTime){
+                    System.err.println("Replicating ${ni} to ${neighBorId}")
+                    replicated = true
+                    val body = MsgBody("append_entries", term = term,leaderId = nodeId,prevLogIndex = ni-1, prevLogTerm = prevLogTerm, entries = entriesToReplicate )
+                    val nodeMsg = NodeMsg(0,neighBorId,body,nodeId)
+                    val msgResp = sendSyncMsg(mapper.writeValueAsString(nodeMsg))
+                    val replyBody = msgResp.body
+                    maybeStepDown(replyBody.term?:-1)
+                    if(nodeState == "leader" && replyBody.term == term){
+                        resetStepDownDeadline()
+                        if(replyBody.success?:false){
+                            nextIndexMap.put(neighBorId, maxOf(nextIndexMap.get(neighBorId)?:0, ni.plus(entriesToReplicate.size)))
+                            matchIndexMap.put(neighBorId, maxOf(matchIndexMap.get(neighBorId)?:0, ni.plus(entriesToReplicate.size -1)))
+                        }
+                        else{
+                         val newNextIndex =   maxOf((nextIndexMap.get(neighBorId)?:0)-1,2 )
+                         nextIndexMap.put(neighBorId,newNextIndex)
+                        }
+                    }
+
+                }
+            }
+            if(replicated) lastReplicatedAt = System.currentTimeMillis()
+        }
+
+        lock.unlock()
+    }
+
+    fun logReplicateScheduler(){
+        Timer().scheduleAtFixedRate( object : TimerTask() {
+            override fun run() {
+                replicateLog()
+            }
+        }, 0, minRepInterval.toLong())
     }
 
 
@@ -354,6 +460,12 @@ data class MsgBody(
     val from: Int? = null,
     val to: Int? = null,
     val value:Int? = null,
+    @JsonProperty("leader_id") val leaderId:String? = null,
+    @JsonProperty("prev_log_index") val prevLogIndex:Int? = null,
+    @JsonProperty("prev_log_term") val prevLogTerm:Int? = null,
+    var success:Boolean? = null,
+    val entries:List<LogEntry>? = null,
+    @JsonProperty("leader_commit") val leaderCommit:Int? = null,
 
     )
 
