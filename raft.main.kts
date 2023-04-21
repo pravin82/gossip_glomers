@@ -407,7 +407,6 @@ class Node(val nodeId:String, val nodeIds:List<String>){
     }
 
     fun serializeMsg(msg:NodeMsg):String{
-     //   if(msg.body.type == "read_ok") mapper.addMixIn(MsgBody::class.java, ValueClass::class.java)
         return mapper.writeValueAsString(msg)
 
     }
