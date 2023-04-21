@@ -1,9 +1,9 @@
 #!/usr/bin/env kotlin
 // ./maelstrom test -w kafka --bin /Users/pravin/gossip_glomers/kafka.main.kts  --node-count 1 --concurrency 2n --time-limit 20  --rate 1000 --log-stderr
+//cat store/latest/node-logs/n1.log
 @file:Repository("https://jcenter.bintray.com")
 @file:DependsOn("com.fasterxml.jackson.core:jackson-core:2.14.2")
 @file:DependsOn("com.fasterxml.jackson.module:jackson-module-kotlin:2.14.2")
-//@file:DependsOn("com.fasterxml.jackson.core:jackson-databind:2.14.2")
 
 import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.annotation.JsonProperty
@@ -105,7 +105,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
                 logLock.tryLock(5,TimeUnit.SECONDS)
                 val opResult = handleOperation(body)
                 logLock.unlock()
-                MsgBody(opResult.type, msgId = randMsgId, inReplyTo = body.msgId ,value = opResult.value)
+                MsgBody(opResult.type, msgId = randMsgId, inReplyTo = body.msgId ,value = opResult.value, code = opResult.code)
 
             }
             "append_entries" -> {
@@ -487,6 +487,7 @@ data class MsgBody(
     var success:Boolean? = null,
     val entries:List<LogEntry>? = null,
     @JsonProperty("leader_commit") val leaderCommit:Int? = null,
+    val code:Int? = null
 
     )
 
