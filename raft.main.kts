@@ -3,17 +3,23 @@
 @file:Repository("https://jcenter.bintray.com")
 @file:DependsOn("com.fasterxml.jackson.core:jackson-core:2.14.2")
 @file:DependsOn("com.fasterxml.jackson.module:jackson-module-kotlin:2.14.2")
+//@file:DependsOn("com.fasterxml.jackson.core:jackson-databind:2.14.2")
 
 import com.fasterxml.jackson.annotation.JsonInclude
 import com.fasterxml.jackson.annotation.JsonProperty
+import com.fasterxml.jackson.core.JsonGenerator
+import com.fasterxml.jackson.databind.JsonSerializer
+import com.fasterxml.jackson.databind.SerializerProvider
+import com.fasterxml.jackson.databind.annotation.JsonSerialize
+import com.fasterxml.jackson.databind.ser.PropertyWriter
 import com.fasterxml.jackson.module.kotlin.jacksonObjectMapper
 import java.util.*
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.Condition
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.thread
-
 val mapper = jacksonObjectMapper()
+
 val EMPTY_STRING = ""
 
 val nodeMap = mutableMapOf<String,Node>()
@@ -129,7 +135,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         }
         if(body.type in listOf("read_ok","write_ok", "request_vote_res", "write_ok", "error","append_entries_ok", "append_entries_res_ok")) return
         val msg = NodeMsg(echoMsg.id,echoMsg.src,replyBody,echoMsg.dest)
-        val replyStr =   mapper.writeValueAsString(msg)
+        val replyStr =   serializeMsg(msg)
         lock.tryLock(5,TimeUnit.SECONDS)
         System.err.println("Sent $replyStr")
         System.out.println( replyStr)
@@ -169,7 +175,8 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         if(nodeState == "leader"){
             entriesLog.add(LogEntry(term, body))
             opResult =  stateMachine.apply(body)
-            System.err.println("Log of leader :${mapper.writeValueAsString(entriesLog)}, OPResult:${opResult}")
+            System.err.println("OpResult:${opResult}")
+            System.err.println("Log of leader :${mapper.writeValueAsString(entriesLog)}")
         }
         return opResult
 
@@ -226,7 +233,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
 
     }
     fun sendSyncMsg(msg:NodeMsg, syncMsgLock: ReentrantLock, condition: Condition):NodeMsg{
-        val msgStr  = mapper.writeValueAsString(msg)
+        val msgStr  = serializeMsg(msg)
         syncMsgLock.tryLock(5,TimeUnit.SECONDS)
         System.err.println("Sent Sync $msgStr")
         System.out.println( msgStr)
@@ -399,6 +406,12 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         }, 0, minRepInterval.toLong())
     }
 
+    fun serializeMsg(msg:NodeMsg):String{
+     //   if(msg.body.type == "read_ok") mapper.addMixIn(MsgBody::class.java, ValueClass::class.java)
+        return mapper.writeValueAsString(msg)
+
+    }
+
 
 
 
@@ -416,7 +429,7 @@ class StorageMap(){
                 if(value != null){
                     OpResult("read_ok",value =  value)
                 }
-                else  OpResult("error",msg = "key not found")
+                else  OpResult("read_ok",msg = "key not found", value = value)
             }
             "write" -> {
                 storageMap.put(key, value = op.value?:-1)
@@ -447,6 +460,7 @@ class StorageMap(){
 data class NodeMsg(
     val id:Int,
     val dest:String,
+    @JsonSerialize(using = MyClassSerializer::class)
     val body:MsgBody,
     val src:String
 
@@ -467,7 +481,7 @@ data class MsgBody(
     val key:String? = null,
     val from: Int? = null,
     val to: Int? = null,
-    val value:Int? = null,
+     val  value:Int? = null,
     @JsonProperty("leader_id") val leaderId:String? = null,
     @JsonProperty("prev_log_index") val prevLogIndex:Int? = null,
     @JsonProperty("prev_log_term") val prevLogTerm:Int? = null,
@@ -476,6 +490,24 @@ data class MsgBody(
     @JsonProperty("leader_commit") val leaderCommit:Int? = null,
 
     )
+
+class MyClassSerializer : JsonSerializer<MsgBody>() {
+    override fun serialize(body: MsgBody, gen: JsonGenerator, serializers: SerializerProvider) {
+        gen.writeStartObject()
+
+        // Use the default serializer for all properties except `value`
+        val defaultSerializer = serializers.findValueSerializer(MsgBody::class.java)
+        defaultSerializer.unwrappingSerializer(null).serialize(body, gen, serializers)
+
+        // Serialize `value` only if `type` is "read_ok"
+        if (body.type == "read_ok" && body.value == null) {
+            gen.writeNullField("value")
+        }
+
+        gen.writeEndObject()
+    }
+}
+
 
 data class LogEntry(
     val term:Int,
@@ -489,4 +521,9 @@ data class OpResult(
     val value:Int? = null,
     val code:Int? = null
 )
+
+
+
+
+
 
