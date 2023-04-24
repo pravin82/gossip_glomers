@@ -45,6 +45,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
     private val schedulerLock =   ReentrantLock()
     private val voteMsgLock =  ReentrantLock()
     private val appendEntryLock = ReentrantLock()
+    private val operationLock = ReentrantLock()
     private val stepDownSchedulerLock =   ReentrantLock()
     private val logRepSchedulerLock =   ReentrantLock()
      private val candidateSchedulerLock =   ReentrantLock()
@@ -64,10 +65,13 @@ class Node(val nodeId:String, val nodeIds:List<String>){
     val matchIndexMap = mutableMapOf<String,Int>()
     val heartBeatInterval = 1000
     var commitIndex = 0
+    var lastAppliedIndex = 1
     val syncMsgMap =   mutableMapOf<Int,Boolean>()
     val votes = mutableSetOf (nodeId)
-    private val voteMsgCondition =  voteMsgLock.newCondition()
+    private var leaderNode = EMPTY_STRING
+     private val voteMsgCondition =  voteMsgLock.newCondition()
      private val appendEntryCondition =  appendEntryLock.newCondition()
+    private val operationCondition =  operationLock.newCondition()
 
 
     fun sendReplyMsg(echoMsg: NodeMsg){
@@ -103,10 +107,19 @@ class Node(val nodeId:String, val nodeIds:List<String>){
             }
             in listOf("cas","read","write") ->{
                 logLock.tryLock(5,TimeUnit.SECONDS)
-                val opResult = handleOperation(body)
+                thread{ handleOperation(echoMsg)}
                 logLock.unlock()
-                MsgBody(opResult.type, msgId = randMsgId, inReplyTo = body.msgId ,value = opResult.value, code = opResult.code)
+                MsgBody(replyType, msgId = randMsgId, inReplyTo = body.msgId )
 
+            }
+            in listOf("cas_ok", "read_ok","write_ok","error")->{
+                operationLock.tryLock(5,TimeUnit.SECONDS)
+                doesReadValueRec = true
+                syncMsgMap.put(echoMsg.body.inReplyTo?:-1, true)
+                voteResp = echoMsg
+                operationCondition.signal()
+                operationLock.unlock()
+                MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
             }
             "append_entries" -> {
                 logLock.tryLock(5,TimeUnit.SECONDS)
@@ -133,7 +146,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
                 MsgBody(replyType,msgId = randMsgId, inReplyTo = body.msgId )
             }
         }
-        if(body.type in listOf("read_ok","write_ok", "request_vote_res", "write_ok", "error","append_entries_ok", "append_entries_res_ok")) return
+        if(body.type in listOf("read_ok","write_ok","cas_ok", "request_vote_res","cas","read","write", "write_ok", "error","append_entries_ok", "append_entries_res_ok")) return
         val msg = NodeMsg(echoMsg.id,echoMsg.src,replyBody,echoMsg.dest)
         val replyStr =   serializeMsg(msg)
         lock.tryLock(5,TimeUnit.SECONDS)
@@ -152,6 +165,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
             return replyBody
         }
         val prevLogIndex = body.prevLogIndex?:-1
+        leaderNode = body.leaderId?:EMPTY_STRING
         resetElectionDeadline()
         if( prevLogIndex <= 0)  {
             System.err.println("Out of bounds previous log index ${prevLogIndex}")
@@ -170,19 +184,33 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         return MsgBody("append_entries_res", term = term, success = true, inReplyTo = msgId)
 
     }
-    fun handleOperation(body:MsgBody):OpResult{
+    fun handleOperation(echoMsg:NodeMsg){
+        val body = echoMsg.body
         var opResult = OpResult("error", msg = "not a leader")
+        val randMsgId = (0..10000).random()
+        System.err.println("In Handle operation LeaderNode:${leaderNode}")
         if(nodeState == "leader"){
-            entriesLog.add(LogEntry(term, body))
+            entriesLog.add(LogEntry(term, echoMsg))
             opResult =  stateMachine.apply(body)
-            System.err.println("OpResult:${opResult}")
             System.err.println("Log of leader :${mapper.writeValueAsString(entriesLog)}")
         }
-        return opResult
+        else if(leaderNode != EMPTY_STRING){
+           val newBody =  body.copy()
+            newBody.msgId = randMsgId
+            val nodeMsg = NodeMsg(1,leaderNode, newBody, nodeId)
+          val respMsg =  sendSyncMsg(nodeMsg,operationLock,operationCondition)
+            val respBody = respMsg.body
+            opResult = OpResult(respBody.type,EMPTY_STRING,respBody.value,respBody.code)
+        }
+        System.err.println("OpResult:${opResult}")
+       val replyBody =  MsgBody(opResult.type, msgId = randMsgId, inReplyTo = body.msgId ,value = opResult.value, code = opResult.code)
+        val msg = NodeMsg(echoMsg.id,echoMsg.src,replyBody,nodeId)
+         sendMsg(msg)
 
     }
     fun becomeCandidate(){
         nodeState = "candidate"
+        leaderNode = EMPTY_STRING
         advanceTerm(term+1)
         resetElectionDeadline()
         resetStepDownDeadline()
@@ -200,6 +228,32 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         else {
             term = newTerm
             votedFor = null
+        }
+
+    }
+
+    fun advanceCommitIndex(){
+        if(nodeState == "leader"){
+            val medianCommit = getMedian(matchIndexMap.values.toList())
+            if(commitIndex < medianCommit && entriesLog.get(medianCommit-1).term == term){
+                System.err.println("Commit index now ${medianCommit}")
+                commitIndex = medianCommit
+            }
+        }
+    }
+    fun advanceStateMachine(){
+        while(lastAppliedIndex < commitIndex){
+            lastAppliedIndex += 1
+            val logEntry = entriesLog.get(lastAppliedIndex-1).op
+            System.err.println("Applying logEntry : ${logEntry}")
+            val resp =   stateMachine.apply(logEntry?.body?: MsgBody("error"))
+            System.err.println("State machine resp is resp : ${resp}")
+            val randMsgId = (0..10000).random()
+            val replyBody =  MsgBody(resp.type, msgId = randMsgId, inReplyTo = logEntry?.body?.msgId ,value = resp.value, code = resp.code)
+            val msg = NodeMsg(0, logEntry?.src?:EMPTY_STRING,replyBody,nodeId)
+            if(nodeState == "leader"){
+                sendMsg(msg)
+            }
         }
 
     }
@@ -226,6 +280,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
     }
     fun becomeFollower(){
         nodeState = "follower"
+        leaderNode = EMPTY_STRING
         resetElectionDeadline()
         matchIndexMap.clear()
         nextIndexMap.clear()
@@ -233,14 +288,10 @@ class Node(val nodeId:String, val nodeIds:List<String>){
 
     }
     fun sendSyncMsg(msg:NodeMsg, syncMsgLock: ReentrantLock, condition: Condition):NodeMsg{
-        val msgStr  = serializeMsg(msg)
         syncMsgLock.tryLock(5,TimeUnit.SECONDS)
-        System.err.println("Sent Sync $msgStr")
-        System.out.println( msgStr)
-        System.out.flush()
+        sendMsg(msg)
         doesReadValueRec = false
         syncMsgMap.put(msg.body.msgId?:-1, false)
-        //(syncMsgMap.get(msg.id)?:false)
         while(!(syncMsgMap.get(msg.body.msgId?:-1)?:false) ){
             condition.await()
         }
@@ -248,8 +299,17 @@ class Node(val nodeId:String, val nodeIds:List<String>){
         return voteResp
 
     }
+    fun sendMsg(msg:NodeMsg){
+        val msgStr  = serializeMsg(msg)
+        System.err.println("Sent $msgStr")
+        System.out.println( msgStr)
+        System.out.flush()
+
+    }
     fun sendVoteReq(){
         thread{
+            val list = listOf(1,2)
+
             neighBorIds.map{
                 val randMsgId = (0..10000).random()
                 val termForVoteRequested = term
@@ -296,6 +356,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
             System.err.println("Should be a candidate")
             return
         }
+        leaderNode = EMPTY_STRING
         nodeState = "leader"
         lastReplicatedAt = 0
         nextIndexMap.clear()
@@ -382,6 +443,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
                         if(replyBody.success?:false){
                             nextIndexMap.put(neighBorId, maxOf(nextIndexMap.get(neighBorId)?:0, ni.plus(entriesToReplicate.size)))
                             matchIndexMap.put(neighBorId, maxOf(matchIndexMap.get(neighBorId)?:0, ni.plus(entriesToReplicate.size -1)))
+                            advanceCommitIndex()
                         }
                         else{
                          val newNextIndex =   maxOf((nextIndexMap.get(neighBorId)?:0)-1,2 )
@@ -408,8 +470,13 @@ class Node(val nodeId:String, val nodeIds:List<String>){
 
     fun serializeMsg(msg:NodeMsg):String{
         return mapper.writeValueAsString(msg)
-
     }
+
+    fun getMedian(list:List<Int>):Int{
+       val majorityNumber = getMajorityNumber()
+      return  list.sorted().get(list.size - majorityNumber)
+    }
+
 
 
 
@@ -470,7 +537,7 @@ data class MsgBody(
     val type:String,
     @JsonProperty("node_id") val nodeId:String? = null,
     @JsonProperty("node_ids")  val nodeIds:List<String>? = null,
-    @JsonProperty("msg_id")   val msgId:Int? = null,
+    @JsonProperty("msg_id")   var msgId:Int? = null,
     @JsonProperty("in_reply_to")   val inReplyTo :Int? = null,
     var term:Int? = null,
     @JsonProperty("last_log_index") val lastLogIndex:Int? = null,
@@ -511,7 +578,7 @@ class MyClassSerializer : JsonSerializer<MsgBody>() {
 
 data class LogEntry(
     val term:Int,
-    val body:MsgBody?=null
+    val op:NodeMsg?=null
 )
 
 
