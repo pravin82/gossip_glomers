@@ -189,29 +189,17 @@ class Node(val nodeId:String, val nodeIds:List<String>){
     }
     fun handleOperation(echoMsg:NodeMsg){
         val body = echoMsg.body
-       // val opResult = OpResult("error", msg = "not a leader")
         val randMsgId = (0..10000).random()
         System.err.println("In Handle operation LeaderNode:${leaderNode}")
         if(nodeState == "leader"){
             entriesLog.add(LogEntry(term, echoMsg))
-          //  opResult =  stateMachine.apply(body)
-           // System.err.println("Log of leader :${mapper.writeValueAsString(entriesLog)}")
         }
         else if(leaderNode != EMPTY_STRING){
            val newBody =  body.copy()
             newBody.msgId = randMsgId
             val nodeMsg = NodeMsg(1,leaderNode, newBody, nodeId)
             srcMap.put(randMsgId,Pair(body.msgId?:-1,echoMsg.src))
-         // val respMsg =  sendSyncMsg(nodeMsg,operationLock,operationCondition)
             sendMsg(nodeMsg)
-           // val respBody = respMsg.body
-           // opResult = OpResult(respBody.type,EMPTY_STRING,respBody.value,respBody.code)
-        }
-       // System.err.println("OpResult:${opResult}")
-      // val replyBody =  MsgBody(opResult.type, msgId = randMsgId, inReplyTo = body.msgId ,value = opResult.value, code = opResult.code)
-      //  val msg = NodeMsg(echoMsg.id,echoMsg.src,replyBody,nodeId)
-        // sendMsg(msg)
-
     }
     fun sendOpRespToClient(echoMsg:NodeMsg){
         val srcDetail = srcMap.get(echoMsg.body.inReplyTo)
@@ -456,6 +444,7 @@ class Node(val nodeId:String, val nodeIds:List<String>){
                     val nodeMsg = NodeMsg(1,neighBorId,body,nodeId)
                     val msgResp = sendSyncMsg(nodeMsg,appendEntryLock,appendEntryCondition)
                     val replyBody = msgResp.body
+                    System.err.println("After append entries Resp: NS :${nodeState}, RT: ${replyBody.term}, TERM: ${term}")
                     maybeStepDown(replyBody.term?:-1)
                     if(nodeState == "leader" && replyBody.term == term){
                         resetStepDownDeadline()
